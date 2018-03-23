@@ -1,0 +1,143 @@
+ceph rbd benchmark
+
+1. update with small IO
+1.1 two replicas
+#create pool
+ceph osd pool create s_pool 2048 2048
+	Q: too many PGs per OSD(444 > max 300)
+	A:add mon_pg_warn_max_per_osd = 1000 into ceph.conf-[global](ceph-deploy/)
+	  push to other mons: ceph-deploy --overwrite-conf config push node1 node2
+	  restart mon: sudo systemctl restart ceph-mon.target
+	  check conf: ceph --show-config | grep mon_pg_warn_max_per_osd
+	  ceph_health OK.
+
+#map pool to a image
+rbd create s_foo --size 10240 (default pool:rbd)
+sudo rbd map s_foo (map to /dev/rbd0)
+	Q:rbd: image s_image: image uses unsupported features
+	A:rbd feature disable s_foo deep-flatten
+	  rbd feature disable s_foo fast-diff
+	  rbd feature disable s_foo object-map
+	  rbd feature disable s_foo exclusive-lock
+	  * rbd feature disable s_foo --pool xxx deep-faltten is applied to a specific pool
+
+#benchmark rados pool
+rados bench -p s_pool 10 write -b 4096 cleanup
+4k-2.6MB/s
+
+#benchmark rbd with a fs
+sudo mkfs.ext4 /dev/rbd0
+sudo mkdir /mnt/ceph-rbd
+sudo mount /dev/rbd0 /mnt/ceph-rbd
+
+#benchmark: FILEBENCH - writefsync
+sudo /usr/local/bin/filebench -f filemicro_writefsync.f (8K append + fsync)
+---result---
+finish               105ops        3ops/s   0.0mb/s      0.0ms/op [0.00ms -  0.00ms]
+sync-file            105ops        3ops/s   0.0mb/s    273.2ms/op [153.63ms - 571.86ms]
+append-file          131251ops     4234ops/s  33.1mb/s      0.0ms/op [0.01ms -  0.11ms]
+32.054: IO Summary: 131356 ops 4236.981 ops/s 0/4234 rd/wr  33.1mb/s   0.2ms/op
+
+sudo ../filebench -f sxf_rwritedsync.f (4k update write + dsync)
+---result---
+finish               1591ops       27ops/s   0.0mb/s      0.0ms/op [0.00ms -  0.00ms]
+write-file           1592ops       27ops/s   0.1mb/s     37.7ms/op [0.04ms - 5152.24ms]
+62.005: IO Summary:  1592 ops 26.530 ops/s 0/27 rd/wr   0.1mb/s  37.7ms/op
+
+---result---(16k update write + dsync)
+finish               1959ops       33ops/s   0.0mb/s      0.0ms/op [0.00ms -  0.00ms]
+write-file           1960ops       33ops/s   0.5mb/s     30.6ms/op [0.05ms - 1032.77ms]
+61.213: IO Summary:  1960 ops 32.664 ops/s 0/33 rd/wr   0.5mb/s  30.6ms/op
+
+1.2 erasure code(6,3)
+# show default erasure code scheme
+ceph osd erasure-code-profile get default
+---result---
+k=2
+m=1
+plugin=jerasure
+technique=reed_sol_van
+
+# reset erasure code profile
+ceph osd erasure-code-profile set myprofile k=6 m=3 crush-failure-domain=rack
+#check profile
+ceph osd erasure-code-profile get myprofile
+---result---
+crush-failure-domain=rack
+jerasure-per-chunk-alignment=false
+k=6
+m=3
+plugin=jerasure
+ruleset-failure-domain=host
+ruleset-root=default
+technique=reed_sol_van
+w=8
+
+#create pool with EC
+ceph osd pool create s_ecpool 1024 1024 erasure myprofile
+
+#rados benchmark
+rados bench -p s_ecpool 10 write -b 4096 cleanup
+---result---
+#IO size | Bandwidth(MB/s)
+4k | 0.8
+16k | 2.27
+64k | 7.56
+128k | 17.87
+256k | 29.73
+512k | 40.8
+
+#create image and map rbd, before that should add a cache tier(ecpool could not map to image)
+ceph osd pool create hot-storage 1024 1024
+ceph osd tier add s_ecpool hot-storage
+ceph osd tier cache-mode hot-storage writeback
+ceph osd tier set-overlay s_ecpool hot-storage
+
+rbd create s_ecimage --size 10240 --pool s_ecpool
+sudo rbd map s_ecimage --pool s_ecpool --name client.admin
+
+#benchmark rbd with a fs
+sudo mkfs.ext4 /dev/rbd1
+sudo mkdir /mnt/ceph-ecrbd
+sudo mount /dev/rbd1 /mnt/ceph-ecrbd
+
+#FILEBENCH benchmark (write + dsync)
+---result-4k---
+finish               1794ops       30ops/s   0.0mb/s      0.0ms/op [0.00ms -  0.00ms]
+write-file           1795ops       30ops/s   0.1mb/s     33.4ms/op [0.05ms - 2554.59ms]
+62.001: IO Summary:  1795 ops 29.914 ops/s 0/30 rd/wr   0.1mb/s  33.4ms/op
+
+---result-16k---
+finish               1336ops       22ops/s   0.0mb/s      0.0ms/op [0.00ms -  0.00ms]
+write-file           1337ops       22ops/s   0.3mb/s     44.9ms/op [0.05ms - 3825.44ms]
+61.013: IO Summary:  1337 ops 22.280 ops/s 0/22 rd/wr   0.3mb/s  44.9ms/op
+
+---result-64k---
+finish               1530ops       25ops/s   0.0mb/s      0.0ms/op [0.00ms -  0.00ms]
+write-file           1531ops       26ops/s   1.6mb/s     39.2ms/op [0.05ms - 2207.76ms]
+61.009: IO Summary:  1531 ops 25.515 ops/s 0/26 rd/wr   1.6mb/s  39.2ms/op
+
+---result-256k---
+finish               1119ops       19ops/s   0.0mb/s      0.0ms/op [0.00ms -  0.00ms]
+write-file           1120ops       19ops/s   4.7mb/s     53.6ms/op [0.05ms - 1720.57ms]
+61.010: IO Summary:  1120 ops 18.665 ops/s 0/19 rd/wr   4.7mb/s  53.6ms/op
+
+---result-1m---
+finish               494ops        8ops/s   0.0mb/s      0.0ms/op [0.00ms -  0.00ms]
+write-file           495ops        8ops/s   8.2mb/s    121.2ms/op [0.05ms - 2133.28ms]
+61.014: IO Summary:   495 ops 8.249 ops/s 0/8 rd/wr   8.2mb/s 121.2ms/op
+
+---result-4m---
+finish               230ops        4ops/s   0.0mb/s      0.0ms/op [0.00ms -  0.00ms]
+write-file           231ops        4ops/s  15.3mb/s    259.5ms/op [0.04ms - 3124.23ms]
+61.012: IO Summary:   231 ops 3.850 ops/s 0/4 rd/wr  15.3mb/s 259.5ms/op
+
+
+#remove cache-tier and ecpool
+ceph osd tier cache-mode hot-storage forward --yes-i-really-mean-it
+rados -p hot-storage ls
+rados -p hot-storage cache-flush-evict-all
+ceph osd tier remove-overlay s_ecpool
+ceph osd tier remove s_ecpool hot-storage
+ceph osd pool delete s_ecpool s_ecpool --yes-i-really-really-mean-it
+ceph osd pool delete hot-storage hot-storage --yes-i-really-really-mean-it
